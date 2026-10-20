@@ -44,6 +44,8 @@
             box-shadow: 0 0 18px rgba(57,255,136,.5); cursor: pointer; }
   #toggle.on { background: var(--warn); box-shadow: 0 0 18px rgba(255,90,90,.5); }
   #toggle:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  select { flex: 1; background: #02080a; color: var(--cyan); border: 1px solid var(--dim);
+           border-radius: 8px; padding: 8px; font: inherit; font-size: 13px; }
   #meter { font-size: 11px; color: var(--dim); text-align: center; min-height: 14px; }
 </style>
 </head>
@@ -68,6 +70,15 @@
     <input id="sens" type="range" min="2" max="20" step="1" value="8">
     <output id="sensOut" for="sens">8 dB</output>
   </div>
+  <div class="row">
+    <label for="micpos">Microfono</label>
+    <select id="micpos">
+      <option value="down" selected>In basso (tipico)</option>
+      <option value="up">In alto</option>
+      <option value="left">A sinistra</option>
+      <option value="right">A destra</option>
+    </select>
+  </div>
   <div id="meter">—</div>
 </footer>
 
@@ -79,11 +90,13 @@
  * ========================================================= */
 const FFT_SIZE      = 4096;     // risoluzione ≈ 11.7 Hz/bin a 48 kHz
 const SWEEP_PERIOD  = 4000;     // ms per un giro completo
-const BLIP_LIFE     = 3500;     // ms di dissolvenza di un blip
 const WARMUP_MS     = 1200;     // tempo di calibrazione del baseline
 const SIDE_FROM     = 3;        // bin (rispetto alla portante) dove parte la banda Doppler
 const SIDE_TO       = 14;       // bin dove finisce
 const BASE_ALPHA    = 0.02;     // velocità di adattamento del baseline (EMA)
+const MAX_RANGE     = 2;        // metri rappresentati dal bordo del radar (stima)
+const FADE_MS       = 900;      // dissolvenza dello spicchio dopo l’ultimo eco
+const HALF_WEDGE    = 0.45;     // semi-apertura dello spicchio (rad, ≈ 26°)
 
 /* =========================================================
  *  STATO
@@ -97,8 +110,8 @@ let spec = null;                 // Float32Array dello spettro (dB)
 let running = false;
 let startTime = 0;
 let baseSide = null, baseCarrier = null;   // baseline adattivi
-let blips = [];                  // { angle, r, t, s }
-let lastBlipT = 0;
+let target = { r: 0, a: 0, t: -1e9 };   // ultimo bersaglio: distanza (m), angolo (rad), istante
+let stereo = false, anL = null, anR = null, specL = null, specR = null, balance = 0;
 let size = 300;
 
 /* =========================================================
@@ -127,7 +140,7 @@ async function start() {
 
     // Microfono "grezzo": i filtri vocali del browser eliminerebbero il tono ultrasonico
     micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 } }
     });
 
     // Emettitore: oscillatore sinusoidale -> gain -> altoparlante
@@ -149,7 +162,23 @@ async function start() {
     micSrc.connect(analyser);
     spec = new Float32Array(analyser.frequencyBinCount);
 
-    running = true; startTime = performance.now(); baseSide = baseCarrier = null; blips = [];
+    // Gli analyser vanno collegati a un nodo muto, altrimenti alcuni browser non li aggiornano
+    const mute = actx.createGain(); mute.gain.value = 0; mute.connect(actx.destination);
+    analyser.connect(mute);
+
+    // Stereo: solo se il telefono fornisce davvero 2 canali (molti sono mono)
+    stereo = (micStream.getAudioTracks()[0].getSettings().channelCount || 1) >= 2;
+    if (stereo) {
+      const split = actx.createChannelSplitter(2);
+      anL = actx.createAnalyser(); anR = actx.createAnalyser();
+      for (const a of [anL, anR]) { a.fftSize = FFT_SIZE; a.smoothingTimeConstant = 0.3;
+        a.minDecibels = -140; a.maxDecibels = 0; a.connect(mute); }
+      micSrc.connect(split); split.connect(anL, 0); split.connect(anR, 1);
+      specL = new Float32Array(anL.frequencyBinCount); specR = new Float32Array(anR.frequencyBinCount);
+    }
+    balance = 0;
+
+    running = true; startTime = performance.now(); baseSide = baseCarrier = null; target.t = -1e9;
     btn.textContent = "STOP"; btn.classList.add("on");
     setStatus("Calibrazione… tieni fermo il telefono (" + Math.round(actx.sampleRate) + " Hz)");
   } catch (e) {
@@ -164,7 +193,7 @@ function stop() {
   try { if (osc) osc.stop(); } catch (_) {}
   if (micStream) micStream.getTracks().forEach(t => t.stop());
   if (actx && actx.state !== "closed") actx.close();
-  actx = osc = outGain = analyser = micStream = micSrc = null;
+  actx = osc = outGain = analyser = micStream = micSrc = anL = anR = null; stereo = false;
   btn.textContent = "START"; btn.classList.remove("on");
   $("meter").textContent = "—";
 }
@@ -179,6 +208,13 @@ function stop() {
  *  Entrambe vengono confrontate con un baseline adattivo (media mobile
  *  esponenziale): si rileva quindi la VARIAZIONE, non il valore assoluto.
  * ========================================================= */
+// Energia media (dB) nelle bande laterali della portante, per un dato spettro
+function bandDb(s, k0) {
+  let p = 0, n = 0;
+  for (let d = SIDE_FROM; d <= SIDE_TO; d++) { p += Math.pow(10, s[k0 - d] / 10) + Math.pow(10, s[k0 + d] / 10); n += 2; }
+  return 10 * Math.log10(p / n + 1e-20);
+}
+
 function analyse(now) {
   analyser.getFloatFrequencyData(spec);
   const binHz = actx.sampleRate / FFT_SIZE;
@@ -210,6 +246,13 @@ function analyse(now) {
     baseCarrier += (carrier - baseCarrier) * a;
   }
 
+  // Direzione: se i canali sono due, la differenza di livello L/R sposta lo spicchio (-1..+1)
+  if (stereo && anL && anR) {
+    anL.getFloatFrequencyData(specL); anR.getFloatFrequencyData(specR);
+    const b = Math.max(-1, Math.min(1, (bandDb(specR, k0) - bandDb(specL, k0)) / 6));
+    balance += (b - balance) * 0.2;
+  }
+
   $("meter").textContent = "Portante " + carrier.toFixed(0) + " dB · Δ " + strength.toFixed(1) + " dB" +
                            (warm ? " · calibrazione" : "");
   if (!warm && $("status").textContent.startsWith("Calibrazione"))
@@ -220,10 +263,15 @@ function analyse(now) {
 
 /* =========================================================
  *  RADAR: DISEGNO
- *  Nota: con un tono continuo non esiste misura reale della distanza.
- *  Il raggio del blip è una stima relativa: più forte è la variazione,
- *  più vicino viene disegnato il blip. L’angolo è quello della scansione.
+ *  Nota: con un tono continuo la distanza è solo una stima dall'intensità
+ *  dell'eco, e la direzione è quella del microfono (più un lieve
+ *  spostamento L/R se il telefono ha due canali).
  * ========================================================= */
+// Angolo (canvas: 0 = destra, π/2 = basso) in cui si trova il microfono
+function micAngle() {
+  return { down: Math.PI / 2, up: -Math.PI / 2, left: Math.PI, right: 0 }[$("micpos").value];
+}
+
 function resize() {
   const dpr = window.devicePixelRatio || 1;
   size = Math.floor(canvas.getBoundingClientRect().width) || 300;
@@ -236,16 +284,20 @@ function draw(now) {
   const c = ctx2d, R = size / 2 - 2, cx = size / 2, cy = size / 2;
   const ang = ((now % SWEEP_PERIOD) / SWEEP_PERIOD) * Math.PI * 2 - Math.PI / 2;
 
-  // Analisi e creazione dei blip
+  // Analisi: quando c'è un eco aggiorna il bersaglio (distanza + direzione)
   if (running && analyser) {
     const r = analyse(now);
-    if (!r.warm && r.strength > r.thr && now - lastBlipT > 90) {
-      const norm = Math.min(1, (r.strength - r.thr) / 20);        // 0..1
-      blips.push({ a: ang, r: 0.92 - norm * 0.75, t: now, s: 0.5 + norm * 0.5 });
-      lastBlipT = now;
+    if (!r.warm && r.strength > r.thr) {
+      // Distanza stimata (euristica): eco forte = oggetto vicino, ~25 dB per ogni decuplo di distanza
+      const m = Math.min(MAX_RANGE, Math.max(0.1, 0.15 * Math.pow(10, (25 - r.strength) / 25)));
+      // Direzione: verso il microfono, spostata dal bilanciamento L/R se il telefono è stereo
+      const a = micAngle() + balance * 0.7;
+      const live = now - target.t < FADE_MS;       // se già attivo, interpola per evitare scatti
+      target.r = live ? target.r + (m - target.r) * 0.25 : m;
+      target.a = live ? target.a + (a - target.a) * 0.25 : a;
+      target.t = now;
     }
   }
-  blips = blips.filter(b => now - b.t < BLIP_LIFE);
 
   // Sfondo con fosforo residuo (effetto persistenza)
   c.fillStyle = "#02080a"; c.fillRect(0, 0, size, size);
@@ -258,6 +310,8 @@ function draw(now) {
   // Cerchi concentrici e assi
   c.strokeStyle = "rgba(57,255,136,.35)"; c.lineWidth = 1;
   for (let i = 1; i <= 4; i++) { c.beginPath(); c.arc(cx, cy, R * i / 4, 0, Math.PI * 2); c.stroke(); }
+  c.fillStyle = "rgba(57,255,136,.55)"; c.font = "10px monospace"; c.textAlign = "left";
+  for (let i = 1; i <= 4; i++) c.fillText((i * MAX_RANGE / 4).toFixed(1) + " m", cx + 4, cy - R * i / 4 + 11);
   c.strokeStyle = "rgba(57,255,136,.2)";
   c.beginPath();
   c.moveTo(cx - R, cy); c.lineTo(cx + R, cy); c.moveTo(cx, cy - R); c.lineTo(cx, cy + R);
@@ -279,18 +333,31 @@ function draw(now) {
   c.beginPath(); c.moveTo(cx, cy); c.lineTo(cx + Math.cos(ang) * R, cy + Math.sin(ang) * R); c.stroke();
   c.shadowBlur = 0;
 
-  // Blip (ciano, con alone e dissolvenza)
-  for (const b of blips) {
-    const life = 1 - (now - b.t) / BLIP_LIFE;
-    const x = cx + Math.cos(b.a) * b.r * R, y = cy + Math.sin(b.a) * b.r * R;
-    const rad = 3 + b.s * 6;
-    const glow = c.createRadialGradient(x, y, 0, x, y, rad * 3);
-    glow.addColorStop(0, "rgba(25,240,255," + (0.9 * life).toFixed(2) + ")");
-    glow.addColorStop(1, "rgba(25,240,255,0)");
-    c.fillStyle = glow; c.beginPath(); c.arc(x, y, rad * 3, 0, Math.PI * 2); c.fill();
-    c.fillStyle = "rgba(220,255,255," + life.toFixed(2) + ")";
-    c.beginPath(); c.arc(x, y, rad * 0.45, 0, Math.PI * 2); c.fill();
+  // Spicchio di rilevamento: parte dal centro, punta verso il microfono e si ferma alla distanza stimata
+  const al = Math.max(0, 1 - (now - target.t) / FADE_MS);
+  if (al > 0) {
+    const rr = Math.min(1, target.r / MAX_RANGE) * R;
+    const a0 = target.a - HALF_WEDGE, a1 = target.a + HALF_WEDGE;
+    const sg = c.createRadialGradient(cx, cy, 0, cx, cy, rr);
+    sg.addColorStop(0, "rgba(25,240,255,0)");
+    sg.addColorStop(1, "rgba(25,240,255," + (0.45 * al).toFixed(2) + ")");
+    c.fillStyle = sg;
+    c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, rr, a0, a1); c.closePath(); c.fill();
+    c.strokeStyle = "rgba(25,240,255," + (0.6 * al).toFixed(2) + ")"; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, rr, a0, a1); c.closePath(); c.stroke();
+    // Fascia luminosa sulla distanza stimata
+    c.strokeStyle = "rgba(220,255,255," + al.toFixed(2) + ")"; c.lineWidth = 5; c.lineCap = "round";
+    c.shadowColor = "#19f0ff"; c.shadowBlur = 14;
+    c.beginPath(); c.arc(cx, cy, rr, a0, a1); c.stroke();
+    c.shadowBlur = 0; c.lineCap = "butt";
+    c.fillStyle = "rgba(220,255,255," + al.toFixed(2) + ")"; c.font = "12px monospace"; c.textAlign = "center";
+    c.fillText("≈ " + target.r.toFixed(1) + " m", cx + Math.cos(target.a) * rr * 0.6, cy + Math.sin(target.a) * rr * 0.6);
   }
+
+  // Indicatore della posizione del microfono sul bordo
+  const ma = micAngle();
+  c.fillStyle = "#39ff88"; c.beginPath();
+  c.arc(cx + Math.cos(ma) * (R - 7), cy + Math.sin(ma) * (R - 7), 4, 0, Math.PI * 2); c.fill();
 
   // Punto centrale (il telefono)
   c.fillStyle = "#39ff88"; c.beginPath(); c.arc(cx, cy, 3, 0, Math.PI * 2); c.fill();
