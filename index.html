@@ -29,7 +29,7 @@
   /* Area del radar: il canvas occupa il quadrato massimo disponibile */
   main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 8px; }
   canvas { width: min(100%, 100%); height: 100%; max-width: 100%; max-height: 100%;
-           aspect-ratio: 1 / 1; border-radius: 50%;
+           aspect-ratio: 1 / 1; border-radius: 14px;
            box-shadow: 0 0 0 1px var(--dim), 0 0 40px rgba(57,255,136,.25), inset 0 0 40px rgba(57,255,136,.12); }
 
   /* Pannello di controllo */
@@ -53,7 +53,7 @@
 
 <header>
   <h1>RADAR SONAR ACUSTICO</h1>
-  <div id="status">Pronto. Usa volume medio e posiziona il telefono fermo.</div>
+  <div id="status">Pronto. Tieni basso il volume del telefono e non avvicinarlo all’orecchio.</div>
 </header>
 
 <main><canvas id="radar"></canvas></main>
@@ -62,8 +62,13 @@
   <button id="toggle" type="button">START</button>
   <div class="row">
     <label for="freq">Frequenza</label>
-    <input id="freq" type="range" min="15000" max="22000" step="100" value="18000">
-    <output id="freqOut" for="freq">18000 Hz</output>
+    <input id="freq" type="range" min="18000" max="22000" step="100" value="20000">
+    <output id="freqOut" for="freq">20000 Hz</output>
+  </div>
+  <div class="row">
+    <label for="pow">Potenza</label>
+    <input id="pow" type="range" min="1" max="10" step="1" value="3">
+    <output id="powOut" for="pow">3/10</output>
   </div>
   <div class="row">
     <label for="sens">Soglia</label>
@@ -94,9 +99,12 @@ const WARMUP_MS     = 1200;     // tempo di calibrazione del baseline
 const SIDE_FROM     = 3;        // bin (rispetto alla portante) dove parte la banda Doppler
 const SIDE_TO       = 14;       // bin dove finisce
 const BASE_ALPHA    = 0.02;     // velocità di adattamento del baseline (EMA)
+const GAIN_MIN      = 0.01;     // volume di emissione minimo (potenza 1)
+const MAX_GAIN      = 0.15;     // LIMITE DURO del volume di emissione (potenza 10)
+const AUTO_STOP_MS  = 10 * 60 * 1000;   // spegnimento automatico dopo 10 minuti
 const MAX_RANGE     = 2;        // metri rappresentati dal bordo del radar (stima)
 const FADE_MS       = 900;      // dissolvenza dello spicchio dopo l’ultimo eco
-const HALF_WEDGE    = 0.45;     // semi-apertura dello spicchio (rad, ≈ 26°)
+const FAN_HALF      = 0.62;     // semi-apertura del ventaglio (rad, ≈ 36° → 71° totali)
 
 /* =========================================================
  *  STATO
@@ -122,9 +130,20 @@ function setStatus(msg, err) { const s = $("status"); s.textContent = msg; s.cla
 freqEl.addEventListener("input", () => {
   const f = +freqEl.value;
   $("freqOut").textContent = f + " Hz";
-  if (osc) osc.frequency.setTargetAtTime(f, actx.currentTime, 0.02);  // cambio liscio, senza click
+  if (osc) osc.frequency.setTargetAtTime(f, actx.currentTime, 0.05);  // cambio liscio, senza click
   baseSide = baseCarrier = null; startTime = performance.now();      // ricalibra
 });
+// Potenza 1..10 -> gain tra GAIN_MIN e MAX_GAIN (mai oltre il limite)
+const powEl = $("pow");
+const gainFor = v => Math.min(MAX_GAIN, GAIN_MIN + (v - 1) / 9 * (MAX_GAIN - GAIN_MIN));
+powEl.addEventListener("input", () => {
+  $("powOut").textContent = powEl.value + "/10";
+  if (outGain) outGain.gain.setTargetAtTime(gainFor(+powEl.value), actx.currentTime, 0.2);
+});
+// Se l'app va in background o la pagina viene nascosta, spegne subito il tono
+document.addEventListener("visibilitychange", () => { if (document.hidden && running) stop(); });
+let autoStopTimer = null, warned = false;
+
 sensEl.addEventListener("input", () => { $("sensOut").textContent = sensEl.value + " dB"; });
 btn.addEventListener("click", () => (running ? stop() : start()));
 
@@ -132,6 +151,14 @@ btn.addEventListener("click", () => (running ? stop() : start()));
  *  AUDIO: START / STOP
  * ========================================================= */
 async function start() {
+  if (!warned) {
+    if (!confirm("ATTENZIONE: il telefono emette un tono ad alta frequenza.\n\n" +
+                 "• Tieni il volume del telefono basso/medio.\n" +
+                 "• Non avvicinare lo speaker all’orecchio.\n" +
+                 "• Non usare cuffie.\n" +
+                 "• Se senti fastidio o fischio, premi STOP.\n\nContinuare?")) return;
+    warned = true;
+  }
   try {
     // Contesto a 48 kHz: serve per rappresentare tono e spettro fino a 22 kHz
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -151,7 +178,8 @@ async function start() {
     outGain.gain.value = 0;
     osc.connect(outGain).connect(actx.destination);
     osc.start();
-    outGain.gain.setTargetAtTime(0.5, actx.currentTime, 0.1);   // fade-in
+    outGain.gain.setTargetAtTime(gainFor(+powEl.value), actx.currentTime, 0.6);   // fade-in lento (~2 s)
+    clearTimeout(autoStopTimer); autoStopTimer = setTimeout(stop, AUTO_STOP_MS);
 
     // Ricevitore: microfono -> analyser (NON collegato alle casse: niente feedback)
     analyser = actx.createAnalyser();
@@ -189,7 +217,8 @@ async function start() {
 }
 
 function stop() {
-  running = false;
+  running = false; clearTimeout(autoStopTimer);
+  if (outGain) outGain.gain.value = 0;   // silenzio immediato
   try { if (osc) osc.stop(); } catch (_) {}
   if (micStream) micStream.getTracks().forEach(t => t.stop());
   if (actx && actx.state !== "closed") actx.close();
@@ -281,86 +310,82 @@ function resize() {
 window.addEventListener("resize", resize);
 
 function draw(now) {
-  const c = ctx2d, R = size / 2 - 2, cx = size / 2, cy = size / 2;
-  const ang = ((now % SWEEP_PERIOD) / SWEEP_PERIOD) * Math.PI * 2 - Math.PI / 2;
+  const c = ctx2d, W = size, R = W / 2 - 2, H = FAN_HALF;
+  const ma = micAngle();
+  const dx = Math.cos(ma), dy = Math.sin(ma);
+  // Origine del ventaglio = il telefono, sul bordo opposto alla direzione del microfono
+  const ox = W / 2 - dx * R * 0.92, oy = W / 2 - dy * R * 0.92;
+  const Rf = R * 1.84;                                   // raggio del ventaglio
 
-  // Analisi: quando c'è un eco aggiorna il bersaglio (distanza + direzione)
+  // ---- Analisi: aggiorna il bersaglio quando c'è un eco
   if (running && analyser) {
     const r = analyse(now);
     if (!r.warm && r.strength > r.thr) {
-      // Distanza stimata (euristica): eco forte = oggetto vicino, ~25 dB per ogni decuplo di distanza
+      // Distanza stimata (euristica): eco forte = vicino, ~25 dB per ogni decuplo di distanza
       const m = Math.min(MAX_RANGE, Math.max(0.1, 0.15 * Math.pow(10, (25 - r.strength) / 25)));
-      // Direzione: verso il microfono, spostata dal bilanciamento L/R se il telefono è stereo
-      const a = micAngle() + balance * 0.7;
-      const live = now - target.t < FADE_MS;       // se già attivo, interpola per evitare scatti
+      const a = balance * H * 0.8;                       // angolo locale (0 = asse del microfono)
+      const live = now - target.t < FADE_MS;            // se già attivo interpola, niente scatti
       target.r = live ? target.r + (m - target.r) * 0.25 : m;
       target.a = live ? target.a + (a - target.a) * 0.25 : a;
       target.t = now;
     }
   }
 
-  // Sfondo con fosforo residuo (effetto persistenza)
-  c.fillStyle = "#02080a"; c.fillRect(0, 0, size, size);
-  c.save(); c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2); c.clip();
+  // ---- Sfondo
+  c.fillStyle = "#02080a"; c.fillRect(0, 0, W, W);
 
-  const g = c.createRadialGradient(cx, cy, 0, cx, cy, R);
-  g.addColorStop(0, "rgba(57,255,136,.10)"); g.addColorStop(1, "rgba(57,255,136,.02)");
-  c.fillStyle = g; c.fillRect(0, 0, size, size);
+  // Tutto il disegno avviene in coordinate locali: origine = telefono, asse x = direzione del microfono
+  c.save(); c.translate(ox, oy); c.rotate(ma);
+  const label = (txt, x, y, col) => {                    // testo sempre dritto
+    c.save(); c.translate(x, y); c.rotate(-ma); c.fillStyle = col;
+    c.font = "11px monospace"; c.textAlign = "center"; c.fillText(txt, 0, 0); c.restore();
+  };
 
-  // Cerchi concentrici e assi
+  // Ventaglio (clip) con fondo sfumato
+  c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, Rf, -H, H); c.closePath();
+  const bg = c.createRadialGradient(0, 0, 0, 0, 0, Rf);
+  bg.addColorStop(0, "rgba(57,255,136,.14)"); bg.addColorStop(1, "rgba(57,255,136,.03)");
+  c.fillStyle = bg; c.fill(); c.clip();
+
+  // Archi di distanza e raggi
   c.strokeStyle = "rgba(57,255,136,.35)"; c.lineWidth = 1;
-  for (let i = 1; i <= 4; i++) { c.beginPath(); c.arc(cx, cy, R * i / 4, 0, Math.PI * 2); c.stroke(); }
-  c.fillStyle = "rgba(57,255,136,.55)"; c.font = "10px monospace"; c.textAlign = "left";
-  for (let i = 1; i <= 4; i++) c.fillText((i * MAX_RANGE / 4).toFixed(1) + " m", cx + 4, cy - R * i / 4 + 11);
-  c.strokeStyle = "rgba(57,255,136,.2)";
-  c.beginPath();
-  c.moveTo(cx - R, cy); c.lineTo(cx + R, cy); c.moveTo(cx, cy - R); c.lineTo(cx, cy + R);
-  for (let d = 45; d < 360; d += 90) {         // assi diagonali
-    const a = d * Math.PI / 180; c.moveTo(cx, cy); c.lineTo(cx + Math.cos(a) * R, cy + Math.sin(a) * R);
-  }
+  for (let i = 1; i <= 4; i++) { c.beginPath(); c.arc(0, 0, Rf * i / 4, -H, H); c.stroke(); }
+  c.strokeStyle = "rgba(57,255,136,.2)"; c.beginPath();
+  for (const k of [-1, -0.5, 0, 0.5, 1]) { c.moveTo(0, 0); c.lineTo(Math.cos(k * H) * Rf, Math.sin(k * H) * Rf); }
   c.stroke();
+  for (let i = 1; i <= 4; i++) label((i * MAX_RANGE / 4).toFixed(1) + " m", Rf * i / 4 - 22, 12, "rgba(57,255,136,.6)");
 
-  // Scia della linea di scansione (spicchi sempre più trasparenti)
-  const TRAIL = 36, SPAN = 0.9;                // radianti di scia
-  for (let i = 0; i < TRAIL; i++) {
-    const a1 = ang - SPAN * (i / TRAIL), a0 = ang - SPAN * ((i + 1) / TRAIL);
-    c.fillStyle = "rgba(57,255,136," + (0.28 * (1 - i / TRAIL)).toFixed(3) + ")";
-    c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, R, a0, a1); c.closePath(); c.fill();
+  // Linea di scansione che oscilla avanti e indietro nel ventaglio, con scia
+  const ph = (now % 3200) / 3200 * Math.PI * 2, sw = H * Math.sin(ph), sg = Math.cos(ph) >= 0 ? 1 : -1;
+  for (let i = 0; i < 20; i++) {
+    const a1 = sw - sg * i * 0.03, a0 = sw - sg * (i + 1) * 0.03;
+    c.fillStyle = "rgba(57,255,136," + (0.22 * (1 - i / 20)).toFixed(3) + ")";
+    c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, Rf, Math.min(a0, a1), Math.max(a0, a1)); c.closePath(); c.fill();
   }
+  c.strokeStyle = "#7dffb0"; c.lineWidth = 2; c.shadowColor = "#39ff88"; c.shadowBlur = 10;
+  c.beginPath(); c.moveTo(0, 0); c.lineTo(Math.cos(sw) * Rf, Math.sin(sw) * Rf); c.stroke(); c.shadowBlur = 0;
 
-  // Linea di scansione
-  c.strokeStyle = "#7dffb0"; c.lineWidth = 2; c.shadowColor = "#39ff88"; c.shadowBlur = 12;
-  c.beginPath(); c.moveTo(cx, cy); c.lineTo(cx + Math.cos(ang) * R, cy + Math.sin(ang) * R); c.stroke();
-  c.shadowBlur = 0;
-
-  // Spicchio di rilevamento: parte dal centro, punta verso il microfono e si ferma alla distanza stimata
+  // Eco: "fetta" piena dal centro fino alla distanza stimata + fascia luminosa sull'arco
   const al = Math.max(0, 1 - (now - target.t) / FADE_MS);
   if (al > 0) {
-    const rr = Math.min(1, target.r / MAX_RANGE) * R;
-    const a0 = target.a - HALF_WEDGE, a1 = target.a + HALF_WEDGE;
-    const sg = c.createRadialGradient(cx, cy, 0, cx, cy, rr);
-    sg.addColorStop(0, "rgba(25,240,255,0)");
-    sg.addColorStop(1, "rgba(25,240,255," + (0.45 * al).toFixed(2) + ")");
-    c.fillStyle = sg;
-    c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, rr, a0, a1); c.closePath(); c.fill();
-    c.strokeStyle = "rgba(25,240,255," + (0.6 * al).toFixed(2) + ")"; c.lineWidth = 1;
-    c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, rr, a0, a1); c.closePath(); c.stroke();
-    // Fascia luminosa sulla distanza stimata
+    const rr = Math.min(1, target.r / MAX_RANGE) * Rf;
+    // Mono: direzione non nota dentro al ventaglio -> si illumina tutta l'apertura. Stereo: fetta stretta.
+    const w = stereo ? 0.22 : H, a0 = Math.max(-H, target.a - w), a1 = Math.min(H, target.a + w);
+    const eg = c.createRadialGradient(0, 0, 0, 0, 0, rr);
+    eg.addColorStop(0, "rgba(25,240,255,0)"); eg.addColorStop(1, "rgba(25,240,255," + (0.5 * al).toFixed(2) + ")");
+    c.fillStyle = eg; c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, rr, a0, a1); c.closePath(); c.fill();
     c.strokeStyle = "rgba(220,255,255," + al.toFixed(2) + ")"; c.lineWidth = 5; c.lineCap = "round";
     c.shadowColor = "#19f0ff"; c.shadowBlur = 14;
-    c.beginPath(); c.arc(cx, cy, rr, a0, a1); c.stroke();
-    c.shadowBlur = 0; c.lineCap = "butt";
-    c.fillStyle = "rgba(220,255,255," + al.toFixed(2) + ")"; c.font = "12px monospace"; c.textAlign = "center";
-    c.fillText("≈ " + target.r.toFixed(1) + " m", cx + Math.cos(target.a) * rr * 0.6, cy + Math.sin(target.a) * rr * 0.6);
+    c.beginPath(); c.arc(0, 0, rr, a0, a1); c.stroke(); c.shadowBlur = 0; c.lineCap = "butt";
+    label("≈ " + target.r.toFixed(1) + " m", Math.max(30, rr - 28), Math.sin((a0 + a1) / 2) * rr * 0.5, "rgba(220,255,255," + al.toFixed(2) + ")");
   }
+  c.restore();
 
-  // Indicatore della posizione del microfono sul bordo
-  const ma = micAngle();
-  c.fillStyle = "#39ff88"; c.beginPath();
-  c.arc(cx + Math.cos(ma) * (R - 7), cy + Math.sin(ma) * (R - 7), 4, 0, Math.PI * 2); c.fill();
-
-  // Punto centrale (il telefono)
-  c.fillStyle = "#39ff88"; c.beginPath(); c.arc(cx, cy, 3, 0, Math.PI * 2); c.fill();
+  // Contorno del ventaglio e punto d'origine (il telefono)
+  c.save(); c.translate(ox, oy); c.rotate(ma);
+  c.strokeStyle = "rgba(57,255,136,.8)"; c.lineWidth = 1.5; c.shadowColor = "#39ff88"; c.shadowBlur = 10;
+  c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, Rf, -H, H); c.closePath(); c.stroke(); c.shadowBlur = 0;
+  c.fillStyle = "#39ff88"; c.beginPath(); c.arc(0, 0, 5, 0, Math.PI * 2); c.fill();
   c.restore();
 
   requestAnimationFrame(draw);
