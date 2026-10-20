@@ -69,13 +69,13 @@
   </div>
   <div class="row">
     <label for="pow">Potenza</label>
-    <input id="pow" type="range" min="1" max="10" step="1" value="3">
-    <output id="powOut" for="pow">3/10</output>
+    <input id="pow" type="range" min="1" max="10" step="1" value="5">
+    <output id="powOut" for="pow">5/10</output>
   </div>
   <div class="row">
     <label for="sens">Soglia</label>
-    <input id="sens" type="range" min="2" max="20" step="1" value="8">
-    <output id="sensOut" for="sens">8 dB</output>
+    <input id="sens" type="range" min="2" max="20" step="1" value="5">
+    <output id="sensOut" for="sens">5 dB</output>
   </div>
   <div class="row">
     <label for="micpos">Microfono</label>
@@ -96,11 +96,11 @@
 /* =========================================================
  *  CONFIGURAZIONE
  * ========================================================= */
-const FFT_SIZE      = 4096;     // risoluzione ≈ 11.7 Hz/bin a 48 kHz
+const FFT_SIZE      = 8192;     // risoluzione ≈ 5.9 Hz/bin a 48 kHz (più sensibile al tono debole)
 const SWEEP_PERIOD  = 4000;     // ms per un giro completo
-const WARMUP_MS     = 1200;     // tempo di calibrazione del baseline
-const SIDE_FROM     = 3;        // bin (rispetto alla portante) dove parte la banda Doppler
-const SIDE_TO       = 14;       // bin dove finisce
+const WARMUP_MS     = 2500;     // tempo di calibrazione del baseline
+const SIDE_FROM     = 6;        // bin (rispetto alla portante) dove parte la banda Doppler
+const SIDE_TO       = 28;       // bin dove finisce
 const BASE_ALPHA    = 0.004;    // adattamento lento del baseline (≈ 4 s): chi sta fermo NON viene assorbito
 const CAR_WEIGHT    = 2.5;      // peso della variazione di livello della portante (presenza statica)
 const HOLD_MS       = 1200;     // tempo in cui i punti restano pieni dopo l'ultimo eco
@@ -123,7 +123,7 @@ let spec = null;                 // Float32Array dello spettro (dB)
 let running = false;
 let startTime = 0;
 let baseSide = null, baseCarrier = null;   // baseline adattivi
-let trail = [], active = false, lastTrail = 0;   // scia di punti e stato di presenza
+let trail = [], active = false, lastTrail = 0, bigSince = 0;   // scia di punti e stato di presenza
 let target = { r: 0, a: 0, t: -1e9 };   // ultimo bersaglio: distanza (m), angolo (rad), istante
 let stereo = false, anL = null, anR = null, specL = null, specR = null, balance = 0;
 let size = 300;
@@ -145,14 +145,18 @@ const gainFor = v => Math.min(MAX_GAIN, GAIN_MIN + (v - 1) / 9 * (MAX_GAIN - GAI
 powEl.addEventListener("input", () => {
   $("powOut").textContent = powEl.value + "/10";
   if (outGain) outGain.gain.setTargetAtTime(gainFor(+powEl.value), actx.currentTime, 0.2);
+  setTimeout(recalibrate, 600);   // il livello è cambiato: il vecchio riferimento non vale più
 });
 // Se l'app va in background o la pagina viene nascosta, spegne subito il tono
 document.addEventListener("visibilitychange", () => { if (document.hidden && running) stop(); });
 let autoStopTimer = null, warned = false;
 
 sensEl.addEventListener("input", () => { $("sensOut").textContent = sensEl.value + " dB"; });
+function recalibrate() {
+  baseSide = baseCarrier = null; startTime = performance.now(); active = false; trail = []; target.t = -1e9; bigSince = 0;
+}
 $("recal").addEventListener("click", () => {     // ricalibra a stanza "vuota"
-  baseSide = baseCarrier = null; startTime = performance.now(); active = false; trail = []; target.t = -1e9;
+  recalibrate();
   if (running) setStatus("Calibrazione… spostati dal campo del telefono per 2 secondi.");
 });
 btn.addEventListener("click", () => (running ? stop() : start()));
@@ -261,7 +265,7 @@ function analyse(now) {
 
   // Livello portante: massimo nei bin centrali
   let carrier = -200;
-  for (let k = k0 - 2; k <= k0 + 2; k++) carrier = Math.max(carrier, spec[k]);
+  for (let k = k0 - 4; k <= k0 + 4; k++) carrier = Math.max(carrier, spec[k]);
 
   // Energia media (potenza lineare -> dB) nelle due bande laterali
   let p = 0, n = 0;
@@ -292,7 +296,7 @@ function analyse(now) {
     balance += (b - balance) * 0.2;
   }
 
-  $("meter").textContent = "Portante " + carrier.toFixed(0) + " dB · Δ " + strength.toFixed(1) + " dB" +
+  $("meter").textContent = "Portante " + carrier.toFixed(0) + " dB · Lat " + side.toFixed(0) + " dB · Δ " + strength.toFixed(1) + " dB" +
                            (warm ? " · calibrazione" : "");
   if (!warm && $("status").textContent.startsWith("Calibrazione"))
     setStatus("Scansione attiva. Muovi una mano davanti al telefono.");
@@ -331,6 +335,9 @@ function draw(now) {
   if (running && analyser) {
     const r = analyse(now);
     const hit = !r.warm && (r.strength > r.thr || (active && r.strength > r.thr * 0.5));
+    // Failsafe: uno scarto > 25 dB per oltre 4 s è un cambio di livello, non una presenza -> ricalibra
+    if (!r.warm && r.strength > 25) { if (!bigSince) bigSince = now; else if (now - bigSince > 4000) recalibrate(); }
+    else bigSince = 0;
     active = hit;
     if (hit) {
       // Distanza stimata (euristica): eco forte = vicino, ~25 dB per ogni decuplo di distanza
