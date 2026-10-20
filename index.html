@@ -46,6 +46,8 @@
   #toggle:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
   select { flex: 1; background: #02080a; color: var(--cyan); border: 1px solid var(--dim);
            border-radius: 8px; padding: 8px; font: inherit; font-size: 13px; }
+  #recal { background: transparent; color: var(--cyan); border: 1px solid var(--cyan); border-radius: 8px;
+           padding: 8px 10px; font: inherit; font-size: 12px; cursor: pointer; }
   #meter { font-size: 11px; color: var(--dim); text-align: center; min-height: 14px; }
 </style>
 </head>
@@ -83,6 +85,7 @@
       <option value="left">A sinistra</option>
       <option value="right">A destra</option>
     </select>
+    <button id="recal" type="button">Ricalibra</button>
   </div>
   <div id="meter">—</div>
 </footer>
@@ -98,7 +101,9 @@ const SWEEP_PERIOD  = 4000;     // ms per un giro completo
 const WARMUP_MS     = 1200;     // tempo di calibrazione del baseline
 const SIDE_FROM     = 3;        // bin (rispetto alla portante) dove parte la banda Doppler
 const SIDE_TO       = 14;       // bin dove finisce
-const BASE_ALPHA    = 0.02;     // velocità di adattamento del baseline (EMA)
+const BASE_ALPHA    = 0.004;    // adattamento lento del baseline (≈ 4 s): chi sta fermo NON viene assorbito
+const CAR_WEIGHT    = 2.5;      // peso della variazione di livello della portante (presenza statica)
+const HOLD_MS       = 1200;     // tempo in cui i punti restano pieni dopo l'ultimo eco
 const GAIN_MIN      = 0.01;     // volume di emissione minimo (potenza 1)
 const MAX_GAIN      = 0.15;     // LIMITE DURO del volume di emissione (potenza 10)
 const AUTO_STOP_MS  = 10 * 60 * 1000;   // spegnimento automatico dopo 10 minuti
@@ -118,6 +123,7 @@ let spec = null;                 // Float32Array dello spettro (dB)
 let running = false;
 let startTime = 0;
 let baseSide = null, baseCarrier = null;   // baseline adattivi
+let trail = [], active = false, lastTrail = 0;   // scia di punti e stato di presenza
 let target = { r: 0, a: 0, t: -1e9 };   // ultimo bersaglio: distanza (m), angolo (rad), istante
 let stereo = false, anL = null, anR = null, specL = null, specR = null, balance = 0;
 let size = 300;
@@ -145,6 +151,10 @@ document.addEventListener("visibilitychange", () => { if (document.hidden && run
 let autoStopTimer = null, warned = false;
 
 sensEl.addEventListener("input", () => { $("sensOut").textContent = sensEl.value + " dB"; });
+$("recal").addEventListener("click", () => {     // ricalibra a stanza "vuota"
+  baseSide = baseCarrier = null; startTime = performance.now(); active = false; trail = []; target.t = -1e9;
+  if (running) setStatus("Calibrazione… spostati dal campo del telefono per 2 secondi.");
+});
 btn.addEventListener("click", () => (running ? stop() : start()));
 
 /* =========================================================
@@ -264,7 +274,7 @@ function analyse(now) {
   if (baseSide === null) { baseSide = side; baseCarrier = carrier; }
   const dSide = side - baseSide;
   const dCar  = Math.abs(carrier - baseCarrier);
-  const strength = Math.max(dSide, dCar);          // dB sopra il baseline
+  const strength = Math.max(dSide, dCar * CAR_WEIGHT);          // dB sopra il baseline
   const warm = now - startTime < WARMUP_MS;
   const thr = +sensEl.value;
 
@@ -317,19 +327,27 @@ function draw(now) {
   const ox = W / 2 - dx * R * 0.92, oy = W / 2 - dy * R * 0.92;
   const Rf = R * 1.84;                                   // raggio del ventaglio
 
-  // ---- Analisi: aggiorna il bersaglio quando c'è un eco
+  // ---- Analisi con isteresi: la presenza resta attiva finché l'eco non scende sotto metà soglia
   if (running && analyser) {
     const r = analyse(now);
-    if (!r.warm && r.strength > r.thr) {
+    const hit = !r.warm && (r.strength > r.thr || (active && r.strength > r.thr * 0.5));
+    active = hit;
+    if (hit) {
       // Distanza stimata (euristica): eco forte = vicino, ~25 dB per ogni decuplo di distanza
       const m = Math.min(MAX_RANGE, Math.max(0.1, 0.15 * Math.pow(10, (25 - r.strength) / 25)));
       const a = balance * H * 0.8;                       // angolo locale (0 = asse del microfono)
-      const live = now - target.t < FADE_MS;            // se già attivo interpola, niente scatti
-      target.r = live ? target.r + (m - target.r) * 0.25 : m;
-      target.a = live ? target.a + (a - target.a) * 0.25 : a;
+      const live = now - target.t < HOLD_MS + FADE_MS;  // se già attivo interpola, niente scatti
+      target.r = live ? target.r + (m - target.r) * 0.2 : m;
+      target.a = live ? target.a + (a - target.a) * 0.2 : a;
       target.t = now;
+      if (now - lastTrail > 350) {                       // punto "fantasma" della scia
+        const sp = stereo ? 0.2 : 0.5;
+        trail.push({ a: target.a + (Math.random() - 0.5) * sp, r: target.r * (1 + (Math.random() - 0.5) * 0.12), t: now });
+        lastTrail = now;
+      }
     }
   }
+  trail = trail.filter(q => now - q.t < 5000);
 
   // ---- Sfondo
   c.fillStyle = "#02080a"; c.fillRect(0, 0, W, W);
@@ -366,18 +384,37 @@ function draw(now) {
   c.beginPath(); c.moveTo(0, 0); c.lineTo(Math.cos(sw) * Rf, Math.sin(sw) * Rf); c.stroke(); c.shadowBlur = 0;
 
   // Eco: "fetta" piena dal centro fino alla distanza stimata + fascia luminosa sull'arco
-  const al = Math.max(0, 1 - (now - target.t) / FADE_MS);
+  const al = Math.max(0, 1 - Math.max(0, now - target.t - HOLD_MS) / FADE_MS);
   if (al > 0) {
     const rr = Math.min(1, target.r / MAX_RANGE) * Rf;
     // Mono: direzione non nota dentro al ventaglio -> si illumina tutta l'apertura. Stereo: fetta stretta.
     const w = stereo ? 0.22 : H, a0 = Math.max(-H, target.a - w), a1 = Math.min(H, target.a + w);
     const eg = c.createRadialGradient(0, 0, 0, 0, 0, rr);
-    eg.addColorStop(0, "rgba(25,240,255,0)"); eg.addColorStop(1, "rgba(25,240,255," + (0.5 * al).toFixed(2) + ")");
+    eg.addColorStop(0, "rgba(25,240,255,0)"); eg.addColorStop(1, "rgba(25,240,255," + (0.28 * al).toFixed(2) + ")");
     c.fillStyle = eg; c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, rr, a0, a1); c.closePath(); c.fill();
     c.strokeStyle = "rgba(220,255,255," + al.toFixed(2) + ")"; c.lineWidth = 5; c.lineCap = "round";
     c.shadowColor = "#19f0ff"; c.shadowBlur = 14;
     c.beginPath(); c.arc(0, 0, rr, a0, a1); c.stroke(); c.shadowBlur = 0; c.lineCap = "butt";
     label("≈ " + target.r.toFixed(1) + " m", Math.max(30, rr - 28), Math.sin((a0 + a1) / 2) * rr * 0.5, "rgba(220,255,255," + al.toFixed(2) + ")");
+  }
+  // Punti: scia (fantasmi che svaniscono in 5 s) + cluster che pulsa sulla posizione attuale
+  for (const q of trail) {
+    const k = 1 - (now - q.t) / 5000, rq = Math.min(1, q.r / MAX_RANGE) * Rf;
+    c.fillStyle = "rgba(25,240,255," + (0.55 * k).toFixed(2) + ")";
+    c.beginPath(); c.arc(Math.cos(q.a) * rq, Math.sin(q.a) * rq, 2.5, 0, Math.PI * 2); c.fill();
+  }
+  if (al > 0) {
+    const rr = Math.min(1, target.r / MAX_RANGE) * Rf;
+    for (let i = 0; i < 8; i++) {
+      const ang = Math.max(-H, Math.min(H, target.a + (stereo ? 0.12 : 0.3) * Math.sin(now / 900 + i * 1.7)));
+      const rad = rr * (1 + 0.06 * Math.sin(now / 700 + i * 2.3));
+      const bl = (0.55 + 0.45 * Math.sin(now / 130 + i * 2.1)) * al;      // lampeggio
+      const x = Math.cos(ang) * rad, y = Math.sin(ang) * rad;
+      const gl = c.createRadialGradient(x, y, 0, x, y, 13);
+      gl.addColorStop(0, "rgba(25,240,255," + (0.9 * bl).toFixed(2) + ")"); gl.addColorStop(1, "rgba(25,240,255,0)");
+      c.fillStyle = gl; c.beginPath(); c.arc(x, y, 13, 0, Math.PI * 2); c.fill();
+      c.fillStyle = "rgba(235,255,255," + bl.toFixed(2) + ")"; c.beginPath(); c.arc(x, y, 2.6, 0, Math.PI * 2); c.fill();
+    }
   }
   c.restore();
 
