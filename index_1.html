@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#02080a">
+<title>Radar Sonar Acustico</title>
+<style>
+  :root {
+    --bg: #02080a;
+    --panel: #061418;
+    --green: #39ff88;
+    --cyan: #19f0ff;
+    --dim: #1d6b55;
+    --warn: #ff5a5a;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--green);
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; overflow: hidden; }
+  body { display: flex; flex-direction: column; padding-top: env(safe-area-inset-top, 0px); }
+
+  header { text-align: center; padding: 10px 12px 0; }
+  h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: .12em; color: var(--cyan);
+       text-shadow: 0 0 10px rgba(25,240,255,.6); }
+  #status { margin-top: 4px; font-size: 11px; color: var(--dim); min-height: 14px; }
+  #status.err { color: var(--warn); }
+
+  /* Area del radar: il canvas occupa il quadrato massimo disponibile */
+  main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 8px; }
+  canvas { width: min(100%, 100%); height: 100%; max-width: 100%; max-height: 100%;
+           aspect-ratio: 1 / 1; border-radius: 50%;
+           box-shadow: 0 0 0 1px var(--dim), 0 0 40px rgba(57,255,136,.25), inset 0 0 40px rgba(57,255,136,.12); }
+
+  /* Pannello di controllo */
+  footer { background: var(--panel); border-top: 1px solid var(--dim);
+           padding: 14px 16px calc(14px + env(safe-area-inset-bottom, 0px)); display: grid; gap: 12px; }
+  .row { display: flex; align-items: center; gap: 12px; }
+  .row label { font-size: 12px; color: var(--dim); min-width: 64px; }
+  .row output { min-width: 84px; text-align: right; font-size: 14px; color: var(--cyan); }
+  input[type=range] { flex: 1; accent-color: var(--green); height: 28px; }
+  #toggle { width: 100%; padding: 14px; font: 600 16px/1 inherit; font-family: inherit; letter-spacing: .15em;
+            color: var(--bg); background: var(--green); border: 0; border-radius: 10px;
+            box-shadow: 0 0 18px rgba(57,255,136,.5); cursor: pointer; }
+  #toggle.on { background: var(--warn); box-shadow: 0 0 18px rgba(255,90,90,.5); }
+  #toggle:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  #meter { font-size: 11px; color: var(--dim); text-align: center; min-height: 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>RADAR SONAR ACUSTICO</h1>
+  <div id="status">Pronto. Usa volume medio e posiziona il telefono fermo.</div>
+</header>
+
+<main><canvas id="radar"></canvas></main>
+
+<footer>
+  <button id="toggle" type="button">START</button>
+  <div class="row">
+    <label for="freq">Frequenza</label>
+    <input id="freq" type="range" min="15000" max="22000" step="100" value="18000">
+    <output id="freqOut" for="freq">18000 Hz</output>
+  </div>
+  <div class="row">
+    <label for="sens">Soglia</label>
+    <input id="sens" type="range" min="2" max="20" step="1" value="8">
+    <output id="sensOut" for="sens">8 dB</output>
+  </div>
+  <div id="meter">—</div>
+</footer>
+
+<script>
+"use strict";
+
+/* =========================================================
+ *  CONFIGURAZIONE
+ * ========================================================= */
+const FFT_SIZE      = 4096;     // risoluzione ≈ 11.7 Hz/bin a 48 kHz
+const SWEEP_PERIOD  = 4000;     // ms per un giro completo
+const BLIP_LIFE     = 3500;     // ms di dissolvenza di un blip
+const WARMUP_MS     = 1200;     // tempo di calibrazione del baseline
+const SIDE_FROM     = 3;        // bin (rispetto alla portante) dove parte la banda Doppler
+const SIDE_TO       = 14;       // bin dove finisce
+const BASE_ALPHA    = 0.02;     // velocità di adattamento del baseline (EMA)
+
+/* =========================================================
+ *  STATO
+ * ========================================================= */
+const $ = id => document.getElementById(id);
+const canvas = $("radar"), ctx2d = canvas.getContext("2d");
+const btn = $("toggle"), freqEl = $("freq"), sensEl = $("sens");
+
+let actx = null, osc = null, outGain = null, analyser = null, micStream = null, micSrc = null;
+let spec = null;                 // Float32Array dello spettro (dB)
+let running = false;
+let startTime = 0;
+let baseSide = null, baseCarrier = null;   // baseline adattivi
+let blips = [];                  // { angle, r, t, s }
+let lastBlipT = 0;
+let size = 300;
+
+/* =========================================================
+ *  UI
+ * ========================================================= */
+function setStatus(msg, err) { const s = $("status"); s.textContent = msg; s.className = err ? "err" : ""; }
+
+freqEl.addEventListener("input", () => {
+  const f = +freqEl.value;
+  $("freqOut").textContent = f + " Hz";
+  if (osc) osc.frequency.setTargetAtTime(f, actx.currentTime, 0.02);  // cambio liscio, senza click
+  baseSide = baseCarrier = null; startTime = performance.now();      // ricalibra
+});
+sensEl.addEventListener("input", () => { $("sensOut").textContent = sensEl.value + " dB"; });
+btn.addEventListener("click", () => (running ? stop() : start()));
+
+/* =========================================================
+ *  AUDIO: START / STOP
+ * ========================================================= */
+async function start() {
+  try {
+    // Contesto a 48 kHz: serve per rappresentare tono e spettro fino a 22 kHz
+    const AC = window.AudioContext || window.webkitAudioContext;
+    actx = new AC({ sampleRate: 48000, latencyHint: "interactive" });
+    await actx.resume();                       // necessario su iOS/Safari (dentro al gesto utente)
+
+    // Microfono "grezzo": i filtri vocali del browser eliminerebbero il tono ultrasonico
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
+    });
+
+    // Emettitore: oscillatore sinusoidale -> gain -> altoparlante
+    osc = actx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = +freqEl.value;
+    outGain = actx.createGain();
+    outGain.gain.value = 0;
+    osc.connect(outGain).connect(actx.destination);
+    osc.start();
+    outGain.gain.setTargetAtTime(0.5, actx.currentTime, 0.1);   // fade-in
+
+    // Ricevitore: microfono -> analyser (NON collegato alle casse: niente feedback)
+    analyser = actx.createAnalyser();
+    analyser.fftSize = FFT_SIZE;
+    analyser.smoothingTimeConstant = 0.3;
+    analyser.minDecibels = -140; analyser.maxDecibels = 0;
+    micSrc = actx.createMediaStreamSource(micStream);
+    micSrc.connect(analyser);
+    spec = new Float32Array(analyser.frequencyBinCount);
+
+    running = true; startTime = performance.now(); baseSide = baseCarrier = null; blips = [];
+    btn.textContent = "STOP"; btn.classList.add("on");
+    setStatus("Calibrazione… tieni fermo il telefono (" + Math.round(actx.sampleRate) + " Hz)");
+  } catch (e) {
+    console.error(e);
+    setStatus(e.name === "NotAllowedError" ? "Permesso microfono negato." : "Errore audio: " + e.message, true);
+    stop();
+  }
+}
+
+function stop() {
+  running = false;
+  try { if (osc) osc.stop(); } catch (_) {}
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (actx && actx.state !== "closed") actx.close();
+  actx = osc = outGain = analyser = micStream = micSrc = null;
+  btn.textContent = "START"; btn.classList.remove("on");
+  $("meter").textContent = "—";
+}
+
+/* =========================================================
+ *  DSP: ANALISI DEL SEGNALE DI RITORNO
+ *  - Portante: livello (dB) del tono emesso, così come rientra nel microfono.
+ *  - Banda Doppler: energia ai lati della portante. Un oggetto in movimento
+ *    riflette il tono con un piccolo shift di frequenza (pochi Hz/decine di Hz).
+ *  - Eco: variazioni rapide del livello della portante (riflessi che si
+ *    sommano o sottraggono al segnale diretto).
+ *  Entrambe vengono confrontate con un baseline adattivo (media mobile
+ *  esponenziale): si rileva quindi la VARIAZIONE, non il valore assoluto.
+ * ========================================================= */
+function analyse(now) {
+  analyser.getFloatFrequencyData(spec);
+  const binHz = actx.sampleRate / FFT_SIZE;
+  const k0 = Math.round(+freqEl.value / binHz);
+
+  // Livello portante: massimo nei bin centrali
+  let carrier = -200;
+  for (let k = k0 - 2; k <= k0 + 2; k++) carrier = Math.max(carrier, spec[k]);
+
+  // Energia media (potenza lineare -> dB) nelle due bande laterali
+  let p = 0, n = 0;
+  for (let d = SIDE_FROM; d <= SIDE_TO; d++) {
+    p += Math.pow(10, spec[k0 - d] / 10) + Math.pow(10, spec[k0 + d] / 10); n += 2;
+  }
+  const side = 10 * Math.log10(p / n + 1e-20);
+
+  // Baseline: parte dal primo campione, poi segue lentamente
+  if (baseSide === null) { baseSide = side; baseCarrier = carrier; }
+  const dSide = side - baseSide;
+  const dCar  = Math.abs(carrier - baseCarrier);
+  const strength = Math.max(dSide, dCar);          // dB sopra il baseline
+  const warm = now - startTime < WARMUP_MS;
+  const thr = +sensEl.value;
+
+  // Aggiorna il baseline solo se non c'è un evento (così l'eco non viene "assorbito")
+  if (warm || strength < thr * 0.6) {
+    const a = warm ? 0.2 : BASE_ALPHA;
+    baseSide += (side - baseSide) * a;
+    baseCarrier += (carrier - baseCarrier) * a;
+  }
+
+  $("meter").textContent = "Portante " + carrier.toFixed(0) + " dB · Δ " + strength.toFixed(1) + " dB" +
+                           (warm ? " · calibrazione" : "");
+  if (!warm && $("status").textContent.startsWith("Calibrazione"))
+    setStatus("Scansione attiva. Muovi una mano davanti al telefono.");
+
+  return { strength, thr, warm };
+}
+
+/* =========================================================
+ *  RADAR: DISEGNO
+ *  Nota: con un tono continuo non esiste misura reale della distanza.
+ *  Il raggio del blip è una stima relativa: più forte è la variazione,
+ *  più vicino viene disegnato il blip. L’angolo è quello della scansione.
+ * ========================================================= */
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  size = Math.floor(canvas.getBoundingClientRect().width) || 300;
+  canvas.width = canvas.height = Math.floor(size * dpr);
+  ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+
+function draw(now) {
+  const c = ctx2d, R = size / 2 - 2, cx = size / 2, cy = size / 2;
+  const ang = ((now % SWEEP_PERIOD) / SWEEP_PERIOD) * Math.PI * 2 - Math.PI / 2;
+
+  // Analisi e creazione dei blip
+  if (running && analyser) {
+    const r = analyse(now);
+    if (!r.warm && r.strength > r.thr && now - lastBlipT > 90) {
+      const norm = Math.min(1, (r.strength - r.thr) / 20);        // 0..1
+      blips.push({ a: ang, r: 0.92 - norm * 0.75, t: now, s: 0.5 + norm * 0.5 });
+      lastBlipT = now;
+    }
+  }
+  blips = blips.filter(b => now - b.t < BLIP_LIFE);
+
+  // Sfondo con fosforo residuo (effetto persistenza)
+  c.fillStyle = "#02080a"; c.fillRect(0, 0, size, size);
+  c.save(); c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2); c.clip();
+
+  const g = c.createRadialGradient(cx, cy, 0, cx, cy, R);
+  g.addColorStop(0, "rgba(57,255,136,.10)"); g.addColorStop(1, "rgba(57,255,136,.02)");
+  c.fillStyle = g; c.fillRect(0, 0, size, size);
+
+  // Cerchi concentrici e assi
+  c.strokeStyle = "rgba(57,255,136,.35)"; c.lineWidth = 1;
+  for (let i = 1; i <= 4; i++) { c.beginPath(); c.arc(cx, cy, R * i / 4, 0, Math.PI * 2); c.stroke(); }
+  c.strokeStyle = "rgba(57,255,136,.2)";
+  c.beginPath();
+  c.moveTo(cx - R, cy); c.lineTo(cx + R, cy); c.moveTo(cx, cy - R); c.lineTo(cx, cy + R);
+  for (let d = 45; d < 360; d += 90) {         // assi diagonali
+    const a = d * Math.PI / 180; c.moveTo(cx, cy); c.lineTo(cx + Math.cos(a) * R, cy + Math.sin(a) * R);
+  }
+  c.stroke();
+
+  // Scia della linea di scansione (spicchi sempre più trasparenti)
+  const TRAIL = 36, SPAN = 0.9;                // radianti di scia
+  for (let i = 0; i < TRAIL; i++) {
+    const a1 = ang - SPAN * (i / TRAIL), a0 = ang - SPAN * ((i + 1) / TRAIL);
+    c.fillStyle = "rgba(57,255,136," + (0.28 * (1 - i / TRAIL)).toFixed(3) + ")";
+    c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, R, a0, a1); c.closePath(); c.fill();
+  }
+
+  // Linea di scansione
+  c.strokeStyle = "#7dffb0"; c.lineWidth = 2; c.shadowColor = "#39ff88"; c.shadowBlur = 12;
+  c.beginPath(); c.moveTo(cx, cy); c.lineTo(cx + Math.cos(ang) * R, cy + Math.sin(ang) * R); c.stroke();
+  c.shadowBlur = 0;
+
+  // Blip (ciano, con alone e dissolvenza)
+  for (const b of blips) {
+    const life = 1 - (now - b.t) / BLIP_LIFE;
+    const x = cx + Math.cos(b.a) * b.r * R, y = cy + Math.sin(b.a) * b.r * R;
+    const rad = 3 + b.s * 6;
+    const glow = c.createRadialGradient(x, y, 0, x, y, rad * 3);
+    glow.addColorStop(0, "rgba(25,240,255," + (0.9 * life).toFixed(2) + ")");
+    glow.addColorStop(1, "rgba(25,240,255,0)");
+    c.fillStyle = glow; c.beginPath(); c.arc(x, y, rad * 3, 0, Math.PI * 2); c.fill();
+    c.fillStyle = "rgba(220,255,255," + life.toFixed(2) + ")";
+    c.beginPath(); c.arc(x, y, rad * 0.45, 0, Math.PI * 2); c.fill();
+  }
+
+  // Punto centrale (il telefono)
+  c.fillStyle = "#39ff88"; c.beginPath(); c.arc(cx, cy, 3, 0, Math.PI * 2); c.fill();
+  c.restore();
+
+  requestAnimationFrame(draw);
+}
+
+resize();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
